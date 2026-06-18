@@ -1,18 +1,24 @@
 """
-YouTube Music addon for Eclipse Music.
+YouTube Music addon for Eclipse Music — no-cookies edition.
 
-Exposes the endpoints Eclipse expects:
-  GET /manifest.json      - describes the addon
-  GET /search?q=...       - tracks / albums / artists / playlists
-  GET /stream/<id>        - resolves a playable audio URL (via yt-dlp)
-  GET /album/<id>         - album tracks (native browsing)
-  GET /artist/<id>        - artist top tracks + albums
-  GET /playlist/<id>      - playlist tracks
+Bypasses YouTube's datacenter bot check using a Proof-of-Origin Token (POT)
+provider + the web_safari client, with Deno solving JS challenges. Because the
+resolved CDN URL is locked to the server's IP, audio is proxied through this
+server so it plays on any device (your phone).
 
-No login required. Powered by ytmusicapi (metadata) + yt-dlp (stream URLs).
+Endpoints:
+  GET /manifest.json
+  GET /search?q=...        tracks / albums / artists / playlists   (ytmusicapi)
+  GET /stream/<id>         returns a proxied audio URL
+  GET /proxy/<id>          streams the audio bytes (range/seek aware)
+  GET /album/<id>          album tracks
+  GET /artist/<id>         artist top tracks + albums
+  GET /playlist/<id>       playlist tracks
 """
 import os
-import base64
+import time
+import threading
+import requests
 import yt_dlp
 from flask import Flask, request, jsonify, redirect, Response, stream_with_context
 from flask_cors import CORS
@@ -20,60 +26,74 @@ from ytmusicapi import YTMusic
 
 app = Flask(__name__)
 CORS(app)
-
 yt = YTMusic()
 
-# direct  -> return Google's CDN URL straight to Eclipse (fast, low bandwidth)
-# proxy   -> stream the audio through this server (works even if the CDN URL is
-#            IP-locked to the server, but uses the host's bandwidth)
-STREAM_MODE = os.environ.get("STREAM_MODE", "direct").lower()
+# direct -> hand the CDN URL to Eclipse (only works if not IP-locked; usually not)
+# proxy  -> stream bytes through this server (default; works on any device)
+STREAM_MODE = os.environ.get("STREAM_MODE", "proxy").lower()
+PLAYER_CLIENT = os.environ.get("YT_CLIENT", "web_safari")
+CACHE_DIR = os.environ.get("YTDLP_CACHE", "/tmp/ytdlp-cache")
 
-# yt-dlp clients that still return real audio URLs after YouTube's SABR change.
-# Order matters â the first that works wins. Override via YT_CLIENTS env
-# (comma-separated), e.g. "ios,ios_music" to force the iPhone client.
-# 'ios'/'android' yield m4a/AAC (best Eclipse compatibility); music clients yield opus.
-_default_clients = "ios_music,tv_embedded,android,android_music,mweb"
-YDL_CLIENTS = [c.strip() for c in os.environ.get("YT_CLIENTS", _default_clients).split(",") if c.strip()]
+# Resolved-URL cache so we don't re-run yt-dlp on every Range request.
+_url_cache = {}            # vid -> (url, content_type, expiry_ts)
+_cache_lock = threading.Lock()
 
-# --------------------------------------------------------------------------- #
-# Anti-bot handling for datacenter hosts (Render, Railway, Fly, ...)
-# YouTube blocks cloud IPs with "Sign in to confirm you're not a bot".
-# Supplying cookies (and optionally a proxy) makes requests look authenticated.
-# --------------------------------------------------------------------------- #
-COOKIE_FILE = None
-# Option 1: paste a base64-encoded Netscape cookies.txt into env var YT_COOKIES_B64
-_cookies_b64 = os.environ.get("YT_COOKIES_B64")
-if _cookies_b64:
-    COOKIE_FILE = "/tmp/yt_cookies.txt"
-    with open(COOKIE_FILE, "wb") as _f:
-        _f.write(base64.b64decode(_cookies_b64))
-# Option 2: ship a cookies.txt file next to app.py
-elif os.path.exists(os.path.join(os.path.dirname(__file__), "cookies.txt")):
-    COOKIE_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 
-# Optional residential proxy, e.g. http://user:pass@host:port
-YT_PROXY = os.environ.get("YT_PROXY")
+def _ydl_opts():
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        # 18 = progressive mp4/AAC with a real https URL; fall back to any
+        # https format that carries audio.
+        "format": "18/best[acodec!=none][protocol^=https]/bestaudio",
+        "extractor_args": {"youtube": {"player_client": [PLAYER_CLIENT]}},
+        "cachedir": CACHE_DIR,
+    }
+
+
+def resolve_url(video_id):
+    """Return (direct_url, content_type). Cached until the URL expires."""
+    now = time.time()
+    with _cache_lock:
+        hit = _url_cache.get(video_id)
+        if hit and hit[2] > now + 60:
+            return hit[0], hit[1]
+
+    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+        info = ydl.extract_info(
+            f"https://music.youtube.com/watch?v={video_id}", download=False
+        )
+    url = info.get("url")
+    if not url and info.get("requested_formats"):
+        url = info["requested_formats"][0].get("url")
+    if not url:
+        raise RuntimeError("no playable url resolved")
+
+    ext = info.get("ext", "m4a")
+    ctype = "audio/mp4" if ext in ("m4a", "mp4") else f"audio/{ext}"
+    # Trust the URL's own expiry if present, else cache 1h.
+    expiry = now + 3600
+    with _cache_lock:
+        _url_cache[video_id] = (url, ctype, expiry)
+    return url, ctype
 
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-def best_thumb(thumbnails):
-    """Return the highest-resolution thumbnail URL from a ytmusicapi list."""
-    if not thumbnails:
+def best_thumb(thumbs):
+    if not thumbs:
         return None
-    return max(thumbnails, key=lambda t: t.get("width", 0) or 0).get("url")
+    return max(thumbs, key=lambda t: t.get("width", 0) or 0).get("url")
 
 
 def artist_names(artists):
-    """Join a ytmusicapi artists list into a display string."""
     if not artists:
         return ""
     return ", ".join(a.get("name", "") for a in artists if a.get("name"))
 
 
 def map_track(item):
-    """Map a ytmusicapi song/track dict to an Eclipse track object."""
     album = item.get("album")
     return {
         "id": item.get("videoId"),
@@ -85,50 +105,15 @@ def map_track(item):
     }
 
 
-def extract_stream(video_id):
-    """Resolve a direct audio URL for a YouTube video id using yt-dlp."""
-    last_err = None
-    for client in YDL_CLIENTS:
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
-            "extractor_args": {"youtube": {"player_client": [client]}},
-        }
-        if COOKIE_FILE:
-            opts["cookiefile"] = COOKIE_FILE
-        if YT_PROXY:
-            opts["proxy"] = YT_PROXY
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(
-                    f"https://music.youtube.com/watch?v={video_id}", download=False
-                )
-            url = info.get("url")
-            if url:
-                ext = info.get("ext", "m4a")
-                fmt = "m4a" if ext in ("m4a", "mp4") else ("ogg" if ext == "webm" else ext)
-                abr = info.get("abr")
-                return {
-                    "url": url,
-                    "format": fmt,
-                    "quality": f"{int(abr)}kbps" if abr else None,
-                }
-        except Exception as e:  # noqa: BLE001
-            last_err = str(e)
-            continue
-    raise RuntimeError(last_err or "no playable format found")
-
-
 # --------------------------------------------------------------------------- #
-# manifest
+# manifest + search
 # --------------------------------------------------------------------------- #
 @app.route("/manifest.json")
 def manifest():
     return jsonify({
         "id": "com.gumloop.ytmusic",
         "name": "YouTube Music",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "description": "Search and stream from YouTube Music",
         "resources": ["search", "stream", "catalog"],
         "types": ["track", "album", "artist"],
@@ -136,9 +121,6 @@ def manifest():
     })
 
 
-# --------------------------------------------------------------------------- #
-# search
-# --------------------------------------------------------------------------- #
 @app.route("/search")
 def search():
     query = request.args.get("q", "").strip()
@@ -147,77 +129,76 @@ def search():
 
     results = yt.search(query, limit=20)
     tracks, albums, artists, playlists = [], [], [], []
-
     for r in results:
-        rtype = r.get("resultType")
-        if rtype in ("song", "video") and r.get("videoId"):
+        t = r.get("resultType")
+        if t in ("song", "video") and r.get("videoId"):
             tracks.append(map_track(r))
-        elif rtype == "album" and r.get("browseId"):
+        elif t == "album" and r.get("browseId"):
             albums.append({
-                "id": r.get("browseId"),
-                "title": r.get("title"),
+                "id": r.get("browseId"), "title": r.get("title"),
                 "artist": artist_names(r.get("artists")),
-                "artworkURL": best_thumb(r.get("thumbnails")),
-                "year": r.get("year"),
+                "artworkURL": best_thumb(r.get("thumbnails")), "year": r.get("year"),
             })
-        elif rtype == "artist" and r.get("browseId"):
+        elif t == "artist" and r.get("browseId"):
             artists.append({
-                "id": r.get("browseId"),
-                "name": r.get("artist"),
+                "id": r.get("browseId"), "name": r.get("artist"),
                 "artworkURL": best_thumb(r.get("thumbnails")),
             })
-        elif rtype == "playlist" and r.get("browseId"):
+        elif t == "playlist" and r.get("browseId"):
             playlists.append({
-                "id": r.get("browseId"),
-                "title": r.get("title"),
+                "id": r.get("browseId"), "title": r.get("title"),
                 "creator": r.get("author"),
                 "artworkURL": best_thumb(r.get("thumbnails")),
                 "trackCount": r.get("itemCount"),
             })
-
-    return jsonify({
-        "tracks": tracks,
-        "albums": albums,
-        "artists": artists,
-        "playlists": playlists,
-    })
+    return jsonify({"tracks": tracks, "albums": albums,
+                    "artists": artists, "playlists": playlists})
 
 
 # --------------------------------------------------------------------------- #
-# stream
+# stream + proxy
 # --------------------------------------------------------------------------- #
 @app.route("/stream/<video_id>")
 def stream(video_id):
     try:
-        resolved = extract_stream(video_id)
+        url, _ = resolve_url(video_id)
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 502
 
-    if STREAM_MODE == "proxy":
-        base = request.host_url.rstrip("/")
-        return jsonify({"url": f"{base}/proxy/{video_id}", "format": resolved["format"]})
+    if STREAM_MODE == "direct":
+        return jsonify({"url": url, "format": "m4a"})
 
-    return jsonify(resolved)
+    base = request.host_url.rstrip("/")
+    return jsonify({"url": f"{base}/proxy/{video_id}", "format": "m4a"})
 
 
 @app.route("/proxy/<video_id>")
 def proxy(video_id):
-    """Stream the audio bytes through this server (for IP-locked CDN URLs)."""
-    import requests as _rq
     try:
-        resolved = extract_stream(video_id)
+        url, ctype = resolve_url(video_id)
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 502
 
-    upstream = _rq.get(resolved["url"], stream=True, timeout=30)
-    ctype = upstream.headers.get("Content-Type", "audio/mp4")
+    fwd = {}
+    if request.headers.get("Range"):
+        fwd["Range"] = request.headers["Range"]
+
+    upstream = requests.get(url, headers=fwd, stream=True, timeout=30)
+    out_headers = {"Accept-Ranges": "bytes", "Content-Type": ctype}
+    for h in ("Content-Length", "Content-Range"):
+        if h in upstream.headers:
+            out_headers[h] = upstream.headers[h]
 
     def generate():
-        for chunk in upstream.iter_content(chunk_size=64 * 1024):
-            if chunk:
-                yield chunk
+        try:
+            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
 
-    return Response(stream_with_context(generate()), content_type=ctype)
+    return Response(stream_with_context(generate()),
+                    status=upstream.status_code, headers=out_headers)
 
 
 # --------------------------------------------------------------------------- #
@@ -227,52 +208,37 @@ def proxy(video_id):
 def album(album_id):
     a = yt.get_album(album_id)
     tracks = [{
-        "id": t.get("videoId"),
-        "title": t.get("title"),
+        "id": t.get("videoId"), "title": t.get("title"),
         "artist": artist_names(t.get("artists")) or artist_names(a.get("artists")),
         "duration": t.get("duration_seconds"),
         "artworkURL": best_thumb(t.get("thumbnails")) or best_thumb(a.get("thumbnails")),
     } for t in a.get("tracks", []) if t.get("videoId")]
-
     return jsonify({
-        "id": album_id,
-        "title": a.get("title"),
+        "id": album_id, "title": a.get("title"),
         "artist": artist_names(a.get("artists")),
         "artworkURL": best_thumb(a.get("thumbnails")),
-        "year": a.get("year"),
-        "description": a.get("description"),
-        "trackCount": a.get("trackCount"),
-        "tracks": tracks,
+        "year": a.get("year"), "description": a.get("description"),
+        "trackCount": a.get("trackCount"), "tracks": tracks,
     })
 
 
 @app.route("/artist/<artist_id>")
 def artist(artist_id):
     ar = yt.get_artist(artist_id)
-    art = best_thumb(ar.get("thumbnails"))
-
     top_tracks = [{
-        "id": s.get("videoId"),
-        "title": s.get("title"),
+        "id": s.get("videoId"), "title": s.get("title"),
         "artist": artist_names(s.get("artists")) or ar.get("name"),
         "artworkURL": best_thumb(s.get("thumbnails")),
     } for s in ar.get("songs", {}).get("results", []) if s.get("videoId")]
-
     albums = [{
-        "id": al.get("browseId"),
-        "title": al.get("title"),
+        "id": al.get("browseId"), "title": al.get("title"),
         "artist": artist_names(al.get("artists")) or ar.get("name"),
-        "artworkURL": best_thumb(al.get("thumbnails")),
-        "year": al.get("year"),
+        "artworkURL": best_thumb(al.get("thumbnails")), "year": al.get("year"),
     } for al in ar.get("albums", {}).get("results", []) if al.get("browseId")]
-
     return jsonify({
-        "id": artist_id,
-        "name": ar.get("name"),
-        "artworkURL": art,
-        "bio": ar.get("description"),
-        "topTracks": top_tracks,
-        "albums": albums,
+        "id": artist_id, "name": ar.get("name"),
+        "artworkURL": best_thumb(ar.get("thumbnails")),
+        "bio": ar.get("description"), "topTracks": top_tracks, "albums": albums,
     })
 
 
@@ -281,21 +247,25 @@ def playlist(playlist_id):
     pid = playlist_id[2:] if playlist_id.startswith("VL") else playlist_id
     p = yt.get_playlist(pid, limit=200)
     tracks = [{
-        "id": t.get("videoId"),
-        "title": t.get("title"),
+        "id": t.get("videoId"), "title": t.get("title"),
         "artist": artist_names(t.get("artists")),
         "duration": t.get("duration_seconds"),
         "artworkURL": best_thumb(t.get("thumbnails")),
     } for t in p.get("tracks", []) if t.get("videoId")]
-
+    creator = p.get("author")
+    if isinstance(creator, dict):
+        creator = creator.get("name")
     return jsonify({
-        "id": playlist_id,
-        "title": p.get("title"),
+        "id": playlist_id, "title": p.get("title"),
         "description": p.get("description"),
         "artworkURL": best_thumb(p.get("thumbnails")),
-        "creator": (p.get("author") or {}).get("name") if isinstance(p.get("author"), dict) else p.get("author"),
-        "tracks": tracks,
+        "creator": creator, "tracks": tracks,
     })
+
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "mode": STREAM_MODE, "client": PLAYER_CLIENT})
 
 
 @app.route("/")
@@ -304,5 +274,4 @@ def home():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 3000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
