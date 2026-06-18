@@ -12,6 +12,7 @@ Exposes the endpoints Eclipse expects:
 No login required. Powered by ytmusicapi (metadata) + yt-dlp (stream URLs).
 """
 import os
+import base64
 import yt_dlp
 from flask import Flask, request, jsonify, redirect, Response, stream_with_context
 from flask_cors import CORS
@@ -28,8 +29,30 @@ yt = YTMusic()
 STREAM_MODE = os.environ.get("STREAM_MODE", "direct").lower()
 
 # yt-dlp clients that still return real audio URLs after YouTube's SABR change.
-# 'android' yields m4a/AAC (best Eclipse compatibility); music clients yield opus.
-YDL_CLIENTS = ["android", "android_music", "ios_music"]
+# Order matters â the first that works wins. Override via YT_CLIENTS env
+# (comma-separated), e.g. "ios,ios_music" to force the iPhone client.
+# 'ios'/'android' yield m4a/AAC (best Eclipse compatibility); music clients yield opus.
+_default_clients = "ios_music,tv_embedded,android,android_music,mweb"
+YDL_CLIENTS = [c.strip() for c in os.environ.get("YT_CLIENTS", _default_clients).split(",") if c.strip()]
+
+# --------------------------------------------------------------------------- #
+# Anti-bot handling for datacenter hosts (Render, Railway, Fly, ...)
+# YouTube blocks cloud IPs with "Sign in to confirm you're not a bot".
+# Supplying cookies (and optionally a proxy) makes requests look authenticated.
+# --------------------------------------------------------------------------- #
+COOKIE_FILE = None
+# Option 1: paste a base64-encoded Netscape cookies.txt into env var YT_COOKIES_B64
+_cookies_b64 = os.environ.get("YT_COOKIES_B64")
+if _cookies_b64:
+    COOKIE_FILE = "/tmp/yt_cookies.txt"
+    with open(COOKIE_FILE, "wb") as _f:
+        _f.write(base64.b64decode(_cookies_b64))
+# Option 2: ship a cookies.txt file next to app.py
+elif os.path.exists(os.path.join(os.path.dirname(__file__), "cookies.txt")):
+    COOKIE_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
+
+# Optional residential proxy, e.g. http://user:pass@host:port
+YT_PROXY = os.environ.get("YT_PROXY")
 
 
 # --------------------------------------------------------------------------- #
@@ -72,6 +95,10 @@ def extract_stream(video_id):
             "format": "bestaudio[ext=m4a]/bestaudio/best",
             "extractor_args": {"youtube": {"player_client": [client]}},
         }
+        if COOKIE_FILE:
+            opts["cookiefile"] = COOKIE_FILE
+        if YT_PROXY:
+            opts["proxy"] = YT_PROXY
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(
